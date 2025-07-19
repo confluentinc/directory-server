@@ -20,6 +20,20 @@
 package org.apache.directory.server.core.security;
 
 
+import org.apache.directory.api.ldap.model.constants.SchemaConstants;
+import org.apache.directory.api.ldap.model.entry.Attribute;
+import org.apache.directory.api.ldap.model.entry.Entry;
+import org.apache.directory.api.ldap.model.exception.LdapException;
+import org.apache.directory.server.i18n.I18n;
+import org.bouncycastle.asn1.x500.X500Name;
+import org.bouncycastle.cert.X509v1CertificateBuilder;
+import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter;
+import org.bouncycastle.cert.jcajce.JcaX509v1CertificateBuilder;
+import org.bouncycastle.jcajce.provider.BouncyCastleFipsProvider;
+import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
 import java.math.BigInteger;
@@ -40,28 +54,13 @@ import java.security.spec.PKCS8EncodedKeySpec;
 import java.security.spec.X509EncodedKeySpec;
 import java.util.Date;
 
-import javax.security.auth.x500.X500Principal;
-
-import org.apache.directory.api.ldap.model.constants.SchemaConstants;
-import org.apache.directory.api.ldap.model.entry.Attribute;
-import org.apache.directory.api.ldap.model.entry.Entry;
-import org.apache.directory.api.ldap.model.exception.LdapException;
-import org.apache.directory.server.i18n.I18n;
-import org.bouncycastle.asn1.x509.BasicConstraints;
-import org.bouncycastle.asn1.x509.ExtendedKeyUsage;
-import org.bouncycastle.asn1.x509.Extension;
-import org.bouncycastle.asn1.x509.KeyPurposeId;
-import org.bouncycastle.jce.provider.BouncyCastleProvider;
-import org.bouncycastle.x509.X509V3CertificateGenerator;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-
 /**
  * Generates the default RSA key pair for the server.
- *
+ * @see https://github.com/apache/directory-server/blob/2.0.0-M20/core/src/main/java/org/apache/directory/server/core/security/TlsKeyGenerator.java
  * @author <a href="mailto:dev@directory.apache.org">Apache Directory Project</a>
+ * @author Farid Zakaria <fzakaria@confluent.io>
  */
+@SuppressWarnings("all")
 public final class TlsKeyGenerator
 {
     private TlsKeyGenerator()
@@ -87,7 +86,7 @@ public final class TlsKeyGenerator
     /* 
      * Eventually we have to make several of these parameters configurable,
      * however note to pass export restrictions we must use a key size of
-     * 512 or less here as the default.  Users can configure this setting
+     * 1024 or less here as the default.  Users can configure this setting
      * later based on their own legal situations.  This is required to 
      * classify ApacheDS in the ECCN 5D002 category.  Please see the following
      * page for more information:
@@ -99,11 +98,12 @@ public final class TlsKeyGenerator
      *    http://www.apache.org/licenses/exports
      */
     private static final int KEY_SIZE = 1024;
-    public static final long YEAR_MILLIS = 365L * 24L * 3600L * 1000L;
+    private static final long YEAR_MILLIS = 365L * 24L * 3600L * 1000L;
 
     static
     {
-        Security.addProvider( new BouncyCastleProvider() );
+        System.out.println("Using a modified version of TlsKeyGenerator to ensure Bouncy Castle FIPS provider is used.");
+        Security.addProvider( new BouncyCastleFipsProvider() );
     }
 
 
@@ -217,18 +217,94 @@ public final class TlsKeyGenerator
      */
     public static void addKeyPair( Entry entry ) throws LdapException
     {
-        String subjectDn = null;
+        Attribute objectClass = entry.get( SchemaConstants.OBJECT_CLASS_AT );
+
+        if ( objectClass == null )
+        {
+            entry.put( SchemaConstants.OBJECT_CLASS_AT, TLS_KEY_INFO_OC, SchemaConstants.INET_ORG_PERSON_OC );
+        }
+        else if ( !objectClass.contains( SchemaConstants.INET_ORG_PERSON_OC ) )
+        {
+            objectClass.add( SchemaConstants.INET_ORG_PERSON_OC );
+        }
+        else if ( !objectClass.contains( TLS_KEY_INFO_OC ) )
+        {
+            objectClass.add( TLS_KEY_INFO_OC );
+        }
+
+        KeyPairGenerator generator = null;
+        try
+        {
+            generator = KeyPairGenerator.getInstance( ALGORITHM );
+        }
+        catch ( NoSuchAlgorithmException e )
+        {
+            LdapException ne = new LdapException( I18n.err( I18n.ERR_291 ) );
+            ne.initCause( e );
+            throw ne;
+        }
+
+        generator.initialize( KEY_SIZE );
+        KeyPair keypair = generator.genKeyPair();
+        entry.put( KEY_ALGORITHM_AT, ALGORITHM );
+
+        // Generate the private key attributes 
+        PrivateKey privateKey = keypair.getPrivate();
+        entry.put( PRIVATE_KEY_AT, privateKey.getEncoded() );
+        entry.put( PRIVATE_KEY_FORMAT_AT, privateKey.getFormat() );
+        LOG.debug( "PrivateKey: {}", privateKey );
+
+        PublicKey publicKey = keypair.getPublic();
+        entry.put( PUBLIC_KEY_AT, publicKey.getEncoded() );
+        entry.put( PUBLIC_KEY_FORMAT_AT, publicKey.getFormat() );
+        LOG.debug( "PublicKey: {}", publicKey );
+
+        // Generate the self-signed certificate
+        Date startDate = new Date();
+        Date expiryDate = new Date( System.currentTimeMillis() + YEAR_MILLIS );
+        BigInteger serialNumber = BigInteger.valueOf( System.currentTimeMillis() );
+
+        X500Name issuerDn = new X500Name( CERTIFICATE_PRINCIPAL_DN );
+        X500Name subjectDn = null;
+
         try
         {
             String hostName = InetAddress.getLocalHost().getHostName();
-            subjectDn = "CN=" + hostName + "," + BASE_DN;
+            subjectDn = new X500Name( "CN=" + hostName + "," + BASE_DN );
         }
         catch ( Exception e )
         {
             LOG.warn( "failed to create certificate subject name from host name", e );
-            subjectDn = CERTIFICATE_PRINCIPAL_DN;
+            subjectDn = issuerDn;
         }
-        addKeyPair( entry, CERTIFICATE_PRINCIPAL_DN, subjectDn, ALGORITHM, KEY_SIZE );
+
+        X509v1CertificateBuilder certGen = new JcaX509v1CertificateBuilder(
+                issuerDn,
+                serialNumber,
+                startDate,
+                expiryDate,
+                subjectDn,
+                publicKey
+        );
+
+        final JcaContentSignerBuilder signerBuilder = new JcaContentSignerBuilder("SHA384withRSA")
+                .setProvider("BCFIPS");
+
+        try
+        {
+            X509Certificate cert = new JcaX509CertificateConverter().setProvider("BCFIPS")
+                    .getCertificate(certGen.build(signerBuilder.build(privateKey)));
+            entry.put( USER_CERTIFICATE_AT, cert.getEncoded() );
+            LOG.debug( "X509 Certificate: {}", cert );
+        }
+        catch ( Exception e )
+        {
+            LdapException ne = new LdapException( I18n.err( I18n.ERR_292 ) );
+            ne.initCause( e );
+            throw ne;
+        }
+
+        LOG.info( "Keys and self signed certificate successfully generated." );
     }
 
 
@@ -301,27 +377,25 @@ public final class TlsKeyGenerator
         // Generate the self-signed certificate
         BigInteger serialNumber = BigInteger.valueOf( System.currentTimeMillis() );
 
-        X509V3CertificateGenerator certGen = new X509V3CertificateGenerator();
-        X500Principal issuerName = new X500Principal( issuerDN );
-        X500Principal subjectName = new X500Principal( subjectDN );
+        X500Name issuerName = new X500Name( issuerDN );
+        X500Name subjectName = new X500Name( subjectDN );
 
-        certGen.setSerialNumber( serialNumber );
-        certGen.setIssuerDN( issuerName );
-        certGen.setNotBefore( startDate );
-        certGen.setNotAfter( expiryDate );
-        certGen.setSubjectDN( subjectName );
-        certGen.setPublicKey( publicKey );
-        certGen.setSignatureAlgorithm( "SHA256With" + keyAlgo );
-        certGen.addExtension( Extension.basicConstraints, false, new BasicConstraints( false ) );
-        certGen.addExtension( Extension.extendedKeyUsage, true, new ExtendedKeyUsage( 
-            new KeyPurposeId[] { KeyPurposeId.id_kp_clientAuth, KeyPurposeId.id_kp_serverAuth } ) );
+        X509v1CertificateBuilder certGen = new JcaX509v1CertificateBuilder(
+                issuerName,
+                serialNumber,
+                startDate,
+                expiryDate,
+                subjectName,
+                publicKey
+        );
 
-        
+        final JcaContentSignerBuilder signerBuilder = new JcaContentSignerBuilder("SHA384withRSA")
+                .setProvider("BCFIPS");
 
         try
         {
-            PrivateKey signingKey = optionalSigningKey != null ? optionalSigningKey : privateKey;
-            X509Certificate cert = certGen.generate( signingKey, "BC" );
+            X509Certificate cert = new JcaX509CertificateConverter().setProvider("BCFIPS")
+                    .getCertificate(certGen.build(signerBuilder.build(privateKey)));
             entry.put( USER_CERTIFICATE_AT, cert.getEncoded() );
             LOG.debug( "X509 Certificate: {}", cert );
         }
