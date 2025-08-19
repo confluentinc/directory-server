@@ -122,7 +122,7 @@ public final class TlsKeyGenerator
 
         try
         {
-            certFactory = CertificateFactory.getInstance( "X.509", "BC" );
+            certFactory = CertificateFactory.getInstance( "X.509", "BCFIPS" );
         }
         catch ( Exception e )
         {
